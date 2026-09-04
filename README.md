@@ -1,54 +1,115 @@
-<p align="center">
-  <img src="https://pac4j.github.io/pac4j/img/logo-shiro.png" width="300" />
-</p>
+# buji-pac4j (Go)
 
-The `buji-pac4j` project is a **bridge from pac4j to Shiro** to push the pac4j security context into the Shiro security context.  
-It's based on the **[pac4j security engine](https://github.com/pac4j/pac4j) v6**. It's available under the Apache 2 license.
+A Go implementation of the **buji-pac4j** security bridge: it pushes a
+[pac4j](https://www.pac4j.org/) security context (authenticated user profiles,
+roles and permissions) into an [Apache Shiro](https://shiro.apache.org/)-style
+security context, so that Shiro's `Subject` reflects the identity established by
+pac4j.
 
-| buji-pac4j     | JDK | pac4j | Shiro | Operating philosophy        | Depends on | Usage of Lombok | Status           |
-|----------------|-----|-------|-------|-----------------------------|------------|-----------------|------------------|
-| version >= 10  | 17  | v6    | v3.x  | Bridge only                 | JakartaEE  | Yes             | Production ready |
-| version >= 9.1 | 17  | v6    | v2.x  | Bridge only                 | JavaEE     | Yes             | Production ready |
-| version >= 9   | 17  | v6    | v1.11 | Bridge only                 | JavaEE     | Yes             | Production ready |
-| version >= 8   | 11  | v5    | v1.9  | Bridge only                 | JavaEE     | No              | Production ready |
-| version >= 6   | 11  | v5    | v1.8  | Standalone security library | JavaEE     | No              | Production ready |
-| version >= 5   | 8   | v4    | v1.5  | Standalone security library | JavaEE     | No              | Production ready |
+This is a faithful port of the original Java library. It preserves the same
+observable functionality, security semantics, authentication/authorization
+flow, configuration behavior, and session lifecycle — reimplemented in idiomatic
+Go with zero Java runtime or Maven dependency.
 
-**It must be used with a [pac4j security library](https://www.pac4j.org/implementations.html)**:
-- Certainly, the [javaee-pac4j or jakartaee-pac4j](https://github.com/pac4j/jee-pac4j) implementation (which has the same filters as `buji-pac4j` version <= 7.x)
-- Or maybe, if you use Spring MVC, the [spring-webmvc-pac4j](https://github.com/pac4j/spring-webmvc-pac4j) implementation.
+## Requirements
 
-While **it is always better to directly use a pac4j security library alone**, this bridge can be used to keep legacy software and avoid full migration.
+- Go 1.23 or newer.
 
+## Build & Test
 
-## Usage
+```bash
+go build ./...
+go vet ./...
+go test ./...
+```
 
-### 1) [Add the required dependencies](https://github.com/bujiio/buji-pac4j/wiki/Dependencies)
+The test suite mirrors the original library's tests one-for-one (17 tests
+covering principal naming, the pac4j→Shiro bridge, session renewal, and
+configuration).
 
-### 2) The bridge is automatically installed
+## What it does
 
-See the [configuration](https://github.com/bujiio/buji-pac4j/blob/master/src/main/resources/buji-pac4j-default.ini) that is loaded by default.
+The library bridges two security models:
 
-### 3) Install, configure and use the pac4j security library
+- **pac4j** produces a set of authenticated `UserProfile`s (one per client),
+  each carrying an id, a client name, attributes, and roles.
+- **Shiro** exposes a `Subject` with a primary principal, a principal
+  collection, authentication state, roles, and permissions.
 
-You must refer to the documentation of the pac4j security library you use: [javaee-pac4j](https://github.com/pac4j/jee-pac4j) (or maybe [spring-webmvc-pac4j](https://github.com/pac4j/spring-webmvc-pac4j)).
+The bridge takes the pac4j profiles and logs the Shiro `Subject` in with them,
+so that downstream Shiro-based authorization sees the pac4j identity.
 
+## Security behavior
 
-## Demo
+### Authentication
 
-Shiro demo: [buji-pac4j-demo](https://github.com/pac4j/buji-pac4j-demo).
+`buji/util.PopulateSubject` is the core entry point. Given the ordered pac4j
+profiles it:
 
+1. Flattens them into a profile list.
+2. Decides, via the pac4j authorizers, whether the user is *fully
+   authenticated* (at least one non-remembered profile) or merely *remembered*.
+3. Logs the Shiro `Subject` in with a `Pac4jToken` carrying those profiles.
 
-## Versions
+On a real login the Shiro security manager **renews the session id**
+(session-fixation protection). The primary principal of the resulting subject is
+the computed **username string**; the principal collection also holds the
+`Pac4jPrincipal` object (retrievable via `OneByType`).
 
-The latest released version is the [![Maven Central](https://img.shields.io/maven-central/v/io.buji/buji-pac4j.svg)](https://repo1.maven.org/maven2/io/buji/buji-pac4j).
-The [next version](https://github.com/bujiio/buji-pac4j/wiki/Next-version) is under development.
+### Principal name
 
-See the [release notes](https://github.com/bujiio/buji-pac4j/wiki/Release-Notes).
+`Pac4jPrincipal.GetName()` resolves the username:
 
-See the [migration guide](https://github.com/bujiio/buji-pac4j/wiki/Migration-guide) as well.
+- If no principal-name attribute is configured, it returns the profile id.
+- Otherwise it returns the named attribute's value (via `String.valueOf`
+  semantics), or nothing when the attribute is absent.
 
+A configured attribute name is trimmed; a blank attribute name is treated as
+unset.
 
-## Need help?
+### Profile refresh keeps the session
 
-You can use the [mailing lists](https://www.pac4j.org/mailing-lists.html) or the [commercial support](https://www.pac4j.org/commercial-support.html).
+When `PopulateSubject` is called again for the **same user** — same number of
+profiles, and each profile matching by client name and id, in order, with an
+unchanged computed principal name — the bridge refreshes the existing
+`Pac4jPrincipal` **in place** instead of logging in again. This keeps the
+current session id (no re-login) while updating attributes such as a refreshed
+access token. Any change to identity (id), client, or principal name triggers a
+fresh login and a new session id.
+
+### Authorization
+
+`Pac4jRealm` derives Shiro authorization info from the profiles:
+
+- **Roles** come from each profile's roles.
+- **Permissions** come from the profile attribute named by the
+  `SHIRO_PERMISSIONS` key (`$shiro_permissions$`), accepting a list or set of
+  strings.
+
+## Configuration
+
+The default configuration resource `buji-pac4j-default.ini` wires the pac4j
+realm and subject factory into the security manager. `Pac4jIniEnvironment`
+loads this embedded resource as the framework configuration.
+
+## Package layout
+
+- `pac4j/` — the pac4j-side model: `profile` (UserProfile/CommonProfile and
+  helpers), `authorization/authorizer` (fully-authenticated / remembered),
+  `context` and `context/session` (web context and session store contracts),
+  `config`, `client`, `cas/config`, `exception`, `framework/adapter`.
+- `shiro/` — the Shiro-side model: `subject` (Subject, SubjectContext,
+  PrincipalCollection), `session`, `authc`, `authz`, `realm`, `mgt`
+  (security manager, delegating subject), `util` (thread-bound security
+  manager and `GetSubject`), `web/mgt`, `web/env`, `io` (serializer).
+- `buji/` — the bridge itself: `subject` (`Pac4jPrincipal`,
+  `Pac4jSubjectFactory`), `token` (`Pac4jToken`), `realm` (`Pac4jRealm`),
+  `context` (`ShiroSessionStore`), `profile` (`ShiroProfileManager`),
+  `util` (`PopulateSubject` and refresh logic), `env`
+  (`Pac4jIniEnvironment`), `resources` (embedded default configuration).
+- `internal/adapter` — the framework adapter that installs the bridge defaults
+  (profile manager factory and session store factory) into a pac4j config.
+
+## License
+
+Apache License 2.0.
